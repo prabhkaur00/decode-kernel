@@ -108,8 +108,15 @@ def _triton(q, kv_data, kv_indptr, kv_indices, kv_last_page_len,
 
 
 def _cuda(q, kv_data, kv_indptr, kv_indices, kv_last_page_len, split_kv):
-    from cuda.build import get_cuda_ext
-    ext = get_cuda_ext()
+    import importlib.util
+    from pathlib import Path
+    _spec = importlib.util.spec_from_file_location(
+        "_cuda_build",
+        Path(__file__).resolve().parent / "cuda" / "build.py",
+    )
+    _mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    ext = _mod.get_cuda_ext()
     if split_kv == 1:
         return ext.decode_attention_naive(
             q, kv_data, kv_indptr, kv_indices, kv_last_page_len

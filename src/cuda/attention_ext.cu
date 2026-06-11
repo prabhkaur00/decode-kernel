@@ -427,50 +427,6 @@ __global__ void decode_attn_reduce_kernel(
     else TORCH_CHECK(false, "Unsupported head_dim: ", HD,   \
                      ".  Must be 64, 128, or 256.")
 
-static void launch_naive(
-    torch::Tensor q, torch::Tensor kv_data,
-    torch::Tensor kv_indptr, torch::Tensor kv_indices,
-    torch::Tensor kv_last_len, torch::Tensor out
-) {
-    const int batch       = q.size(0);
-    const int num_q_heads = q.size(1);
-    const int head_dim    = q.size(2);
-    const int page_size   = kv_data.size(2);
-    const int num_kv_heads= kv_data.size(3);
-    TORCH_CHECK(page_size == 16, "CUDA kernel requires page_size == 16");
-
-    const int group_size  = num_q_heads / num_kv_heads;
-    const float scale     = 1.0f / sqrtf(static_cast<float>(head_dim));
-
-    const dim3 grid(batch, num_q_heads);
-    const dim3 block(head_dim);
-
-    // Shared memory: see SmemLayout
-    const int smem_bytes = (16 * head_dim + (head_dim/32) * 16 + 16) * sizeof(float);
-
-    auto q_ptr  = reinterpret_cast<const __half*>(q.data_ptr());
-    auto kv_ptr = reinterpret_cast<const __half*>(kv_data.data_ptr());
-    auto o_ptr  = reinterpret_cast<__half*>(out.data_ptr());
-
-    DISPATCH_HD(decode_attn_naive_kernel, head_dim,
-        q_ptr, kv_ptr,
-        kv_indptr.data_ptr<int>(), kv_indices.data_ptr<int>(),
-        kv_last_len.data_ptr<int>(), o_ptr,
-        (int)q.stride(0),       (int)q.stride(1),
-        (int)kv_data.stride(0), (int)kv_data.stride(1),
-        (int)kv_data.stride(2), (int)kv_data.stride(3),
-        (int)out.stride(0),     (int)out.stride(1),
-        scale, group_size,
-        // <<< grid, block, smem >>>
-        grid, block, smem_bytes
-    );
-    // ^ DISPATCH_HD substitutes the template args and appends <<< >>> from __VA_ARGS__
-    // but that won't compile as written — need to restructure the call.
-}
-
-// The DISPATCH_HD macro doesn't pass launch configs cleanly.
-// Use a helper template function instead:
-
 template<int HEAD_DIM>
 static void launch_naive_hd(
     const __half* q_ptr, const __half* kv_ptr,
