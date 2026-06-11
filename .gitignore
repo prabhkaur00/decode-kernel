@@ -1,0 +1,29 @@
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.env
+
+# Triton cache
+~/.triton/
+.triton/
+
+# Results (track only .gitkeep)
+results/*.csv
+results/plots/
+results/sglang/*.json
+results/profiles/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model weights
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# ncu profiles
+*.ncu-rep
