@@ -18,12 +18,26 @@ IMPL_COLORS = {
     "flashinfer":      "#2196F3",
     "naive_triton":    "#F44336",
     "split_kv_triton": "#4CAF50",
+    "cuda_naive":      "#F44336",
+    "cuda_split_kv":   "#4CAF50",
 }
 IMPL_LABELS = {
     "flashinfer":      "FlashInfer",
     "naive_triton":    "Naive Triton",
     "split_kv_triton": "Split KV Triton",
+    "cuda_naive":      "Naive CUDA",
+    "cuda_split_kv":   "Split KV CUDA",
 }
+_FALLBACK_COLORS = ["#FF9800", "#9C27B0", "#00BCD4", "#795548"]
+
+def _impl_color(impl: str) -> str:
+    if impl in IMPL_COLORS:
+        return IMPL_COLORS[impl]
+    idx = abs(hash(impl)) % len(_FALLBACK_COLORS)
+    return _FALLBACK_COLORS[idx]
+
+def _impl_label(impl: str) -> str:
+    return IMPL_LABELS.get(impl, impl)
 
 plt.rcParams.update({
     "figure.dpi": 150,
@@ -50,18 +64,16 @@ def plot1_latency_vs_split(df: pd.DataFrame, out_dir: Path):
     for ax, ctx in zip(axes, ctx_lengths):
         sub = df[df["context_length"] == ctx]
 
-        for impl in ["flashinfer", "naive_triton", "split_kv_triton"]:
+        for impl in sorted(sub["implementation"].unique()):
             rows = sub[sub["implementation"] == impl]
             if rows.empty:
                 continue
-            c = IMPL_COLORS[impl]
-            lbl = IMPL_LABELS[impl]
+            c   = _impl_color(impl)
+            lbl = _impl_label(impl)
             if impl == "flashinfer":
-                # FlashInfer doesn't vary SPLIT_KV; draw as horizontal line
                 lat = rows["latency_ms_p50"].mean()
                 ax.axhline(lat, color=c, linestyle="--", label=lbl)
-            elif impl == "naive_triton":
-                # Naive uses SPLIT_KV=1 only
+            elif "naive" in impl:
                 lat = rows["latency_ms_p50"].values[0]
                 ax.axhline(lat, color=c, linestyle=":", label=lbl)
             else:
@@ -98,12 +110,12 @@ def plot2_latency_vs_ctx(df: pd.DataFrame, out_dir: Path):
 
     for ax, batch in zip(axes, batch_sizes):
         sub = best[best["batch_size"] == batch]
-        for impl in ["flashinfer", "naive_triton", "split_kv_triton"]:
+        for impl in sorted(sub["implementation"].unique()):
             rows = sub[sub["implementation"] == impl].sort_values("context_length")
             if rows.empty:
                 continue
             ax.plot(rows["context_length"] / 1024, rows["latency_ms_p50"],
-                    marker="o", color=IMPL_COLORS[impl], label=IMPL_LABELS[impl])
+                    marker="o", color=_impl_color(impl), label=_impl_label(impl))
         ax.set_title(f"batch={batch}")
         ax.set_xlabel("Context length (k tokens)")
         ax.set_ylabel("Latency (ms)")
@@ -125,12 +137,12 @@ def plot3_bw_pct(df: pd.DataFrame, out_dir: Path):
               ["bw_pct_of_peak"].max().reset_index())
 
     fig, ax = plt.subplots(figsize=(8, 4))
-    for impl in ["flashinfer", "naive_triton", "split_kv_triton"]:
+    for impl in sorted(best["implementation"].unique()):
         rows = best[best["implementation"] == impl].sort_values("context_length")
         if rows.empty:
             continue
         ax.plot(rows["context_length"] / 1024, rows["bw_pct_of_peak"],
-                marker="o", color=IMPL_COLORS[impl], label=IMPL_LABELS[impl])
+                marker="o", color=_impl_color(impl), label=_impl_label(impl))
 
     ax.axhline(100, color="black", linestyle="--", alpha=0.4, label="Peak BW")
     ax.set_xlabel("Context length (k tokens)")
@@ -166,16 +178,14 @@ def plot4_roofline(df: pd.DataFrame, out_dir: Path,
 
     # Data points
     group_size = num_q_heads // num_kv_heads
-    for impl in ["flashinfer", "naive_triton", "split_kv_triton"]:
+    for impl in sorted(df["implementation"].unique()):
         rows = df[df["implementation"] == impl]
         if rows.empty:
             continue
-        # AI = H_q / (2 * H_kv) (independent of ctx, batch)
-        ai = group_size / 2.0
-        # Achieved TFLOPs = achieved_bw * AI
+        ai     = group_size / 2.0
         tflops = rows["achieved_bw_gb_s"] / 1e3 * ai
         ax.scatter([ai] * len(tflops), tflops,
-                   color=IMPL_COLORS[impl], label=IMPL_LABELS[impl],
+                   color=_impl_color(impl), label=_impl_label(impl),
                    alpha=0.7, s=40)
 
     ax.set_xlabel("Arithmetic Intensity (FLOPs / byte)")
@@ -192,16 +202,30 @@ def plot4_roofline(df: pd.DataFrame, out_dir: Path,
 # ── Plot 5: speedup heatmap ────────────────────────────────────────────────
 
 def plot5_speedup_heatmap(df: pd.DataFrame, out_dir: Path):
-    naive = df[df["implementation"] == "naive_triton"][
+    # Auto-detect naive and split implementations so this works with both
+    # Triton ("naive_triton", "split_kv_triton") and CUDA ("cuda_naive", "cuda_split_kv") CSVs.
+    impls = df["implementation"].unique()
+    naive_impls = [i for i in impls if "naive" in i]
+    split_impls = [i for i in impls if "split" in i]
+    if not naive_impls or not split_impls:
+        print(f"plot5: need a naive and a split-KV impl; found {list(impls)} — skipping")
+        return
+    naive_impl = naive_impls[0]
+    split_impl = split_impls[0]
+
+    naive = df[df["implementation"] == naive_impl][
         ["context_length", "batch_size", "latency_ms_p50"]
     ].rename(columns={"latency_ms_p50": "lat_naive"})
 
-    best_split = (df[df["implementation"] == "split_kv_triton"]
+    best_split = (df[df["implementation"] == split_impl]
                   .groupby(["context_length", "batch_size"])["latency_ms_p50"]
                   .min().reset_index()
                   .rename(columns={"latency_ms_p50": "lat_split"}))
 
     merged = naive.merge(best_split, on=["context_length", "batch_size"])
+    if merged.empty:
+        print("plot5: no overlapping (context_length, batch_size) rows — skipping")
+        return
     merged["speedup"] = merged["lat_naive"] / merged["lat_split"]
 
     ctx_vals   = sorted(merged["context_length"].unique())
@@ -214,9 +238,11 @@ def plot5_speedup_heatmap(df: pd.DataFrame, out_dir: Path):
             if not row.empty:
                 matrix[i, j] = row["speedup"].values[0]
 
+    vmax = matrix.max() if matrix.size > 0 and matrix.max() > 1.0 else 2.0
+
     fig, ax = plt.subplots(figsize=(6, 5))
     im = ax.imshow(matrix, cmap="RdYlGn", aspect="auto",
-                   vmin=1.0, vmax=matrix.max() + 0.1)
+                   vmin=1.0, vmax=vmax + 0.1)
     ax.set_xticks(range(len(batch_vals)))
     ax.set_xticklabels([f"B={b}" for b in batch_vals])
     ax.set_yticks(range(len(ctx_vals)))
@@ -243,22 +269,27 @@ def plot6_gap_to_flashinfer(df: pd.DataFrame, out_dir: Path):
         "latency_ms_p50"
     ].mean().reset_index().rename(columns={"latency_ms_p50": "lat_fi"})
 
-    best_split = (df[df["implementation"] == "split_kv_triton"]
+    split_impls = [i for i in df["implementation"].unique() if "split" in i]
+    if fi.empty or not split_impls:
+        print("  Plot 6: skipped (no FlashInfer or split-KV rows in CSV)")
+        return
+    split_impl = split_impls[0]
+
+    best_split = (df[df["implementation"] == split_impl]
                   .groupby("context_length")["latency_ms_p50"]
                   .min().reset_index()
                   .rename(columns={"latency_ms_p50": "lat_split"}))
 
-    if fi.empty:
-        print("  Plot 6: skipped (no FlashInfer rows in CSV)")
-        return
-
     merged = fi.merge(best_split, on="context_length")
+    if merged.empty:
+        print("  Plot 6: skipped (no overlapping context_length rows)")
+        return
     merged["ratio"] = merged["lat_split"] / merged["lat_fi"]
     merged = merged.sort_values("context_length")
 
     fig, ax = plt.subplots(figsize=(7, 4))
     x = range(len(merged))
-    bars = ax.bar(x, merged["ratio"], color=IMPL_COLORS["split_kv_triton"],
+    ax.bar(x, merged["ratio"], color=_impl_color(split_impl),
                   edgecolor="black", linewidth=0.5)
     ax.axhline(1.0, color="black", linestyle="--", label="Parity with FlashInfer")
     ax.set_xticks(list(x))
