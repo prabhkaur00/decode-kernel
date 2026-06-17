@@ -1,67 +1,77 @@
 """
-NVTX-annotated profiling script for the naive decode attention kernel.
+Standalone driver for nsys profiling of the decode attention CUDA kernels.
 
-Kernel logic is unchanged — NVTX ranges are added only around Python-level
-kernel dispatches so nsys shows labelled bands on the GPU timeline.
-
-Usage:
-    nsys profile --trace=cuda,nvtx -o results/naive_nvtx \
-        python bench/profile_naive_nvtx.py
+Run with:
+  nsys profile --trace=cuda,nvtx --force-overwrite=true \
+      -o results/naive_nvtx python bench/profile_naive_nvtx.py
 """
-from __future__ import annotations
-
+import os
 import sys
 from pathlib import Path
 
 import torch
+import torch.cuda.nvtx as nvtx
+from torch.utils.cpp_extension import load
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+# ── repo paths ────────────────────────────────────────────────────────────
+REPO = Path(__file__).resolve().parent.parent
+SRC  = REPO / "src"
+sys.path.insert(0, str(SRC))                 # so `import layout` works
+from layout import synthesize                # noqa: E402
 
-from layout import synthesize
-from kernel_naive import decode_attention_naive
+# ── build the extension (JIT) ─────────────────────────────────────────────
+ext = load(
+    name="attention_ext",
+    sources=[str(SRC / "attention_ext.cu")],
+    extra_include_paths=[str(SRC)],
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+    verbose=True,
+)
 
-BATCH        = 1
-CTX          = 8192
-PAGE_SIZE    = 16
-NUM_Q_HEADS  = 32
-NUM_KV_HEADS = 8
-HEAD_DIM     = 128
-DTYPE        = torch.float16
-DEVICE       = "cuda"
-WARMUP       = 5
-TIMED        = 10
+# ── workload config ───────────────────────────────────────────────────────
+BATCH, CTX, HQ, HKV, HD, PAGE = 4, 2048, 8, 2, 128, 16
+SPLIT_KV = 4
+WARMUP_ITERS = 5
+PROFILE_ITERS = 20
 
+q, kv_data, kv_indptr, kv_indices, kv_last, layout = synthesize(
+    batch=BATCH, context_length=CTX,
+    num_q_heads=HQ, num_kv_heads=HKV,
+    head_dim=HD, page_size=PAGE,
+    dtype=torch.float16, device="cuda",
+)
+layout.validate(kv_data, kv_indptr, kv_indices, kv_last)
 
-def main():
-    q, kv_data, kv_indptr, kv_indices, kv_last_page_len, _ = synthesize(
-        batch=BATCH,
-        context_length=CTX,
-        num_q_heads=NUM_Q_HEADS,
-        num_kv_heads=NUM_KV_HEADS,
-        head_dim=HEAD_DIM,
-        page_size=PAGE_SIZE,
-        dtype=DTYPE,
-        device=DEVICE,
-    )
+print(f"GPU: {torch.cuda.get_device_name(0)}")
+print(f"Q shape: {tuple(q.shape)}, kv_data shape: {tuple(kv_data.shape)}")
 
-    # ── Warmup: trigger Triton JIT outside the profiled region ────────────
-    torch.cuda.nvtx.range_push("warmup")
-    for _ in range(WARMUP):
-        decode_attention_naive(q, kv_data, kv_indptr, kv_indices, kv_last_page_len)
+# ── warmup (labelled so you can ignore it on the timeline) ────────────────
+nvtx.range_push("warmup")
+for _ in range(WARMUP_ITERS):
+    _ = ext.decode_attention_naive(q, kv_data, kv_indptr, kv_indices, kv_last)
+    _ = ext.decode_attention_split_kv(q, kv_data, kv_indptr, kv_indices, kv_last, SPLIT_KV)
+torch.cuda.synchronize()
+nvtx.range_pop()
+
+# ── profiled iterations ───────────────────────────────────────────────────
+nvtx.range_push("naive_loop")
+for i in range(PROFILE_ITERS):
+    nvtx.range_push(f"naive_iter_{i}")
+    out_naive = ext.decode_attention_naive(q, kv_data, kv_indptr, kv_indices, kv_last)
     torch.cuda.synchronize()
-    torch.cuda.nvtx.range_pop()
+    nvtx.range_pop()
+nvtx.range_pop()
 
-    # ── Timed / profiled iterations ───────────────────────────────────────
-    torch.cuda.nvtx.range_push("profile_region")
-    for i in range(TIMED):
-        torch.cuda.nvtx.range_push(f"naive_decode_iter{i}")
-        decode_attention_naive(q, kv_data, kv_indptr, kv_indices, kv_last_page_len)
-        torch.cuda.nvtx.range_pop()
+nvtx.range_push("split_kv_loop")
+for i in range(PROFILE_ITERS):
+    nvtx.range_push(f"splitkv_iter_{i}")
+    out_split = ext.decode_attention_split_kv(q, kv_data, kv_indptr, kv_indices, kv_last, SPLIT_KV)
     torch.cuda.synchronize()
-    torch.cuda.nvtx.range_pop()
+    nvtx.range_pop()
+nvtx.range_pop()
 
-
-if __name__ == "__main__":
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA required")
-    main()
+# ── sanity check ──────────────────────────────────────────────────────────
+max_diff = (out_naive.float() - out_split.float()).abs().max().item()
+print(f"max abs diff naive vs split_kv: {max_diff:.5f}")
+print("done")
