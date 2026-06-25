@@ -28,10 +28,8 @@ from pathlib import Path
 import torch
 import torch.cuda.nvtx as nvtx
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-
 from layout import synthesize
-from cuda.build import get_split_kv_ext
+from cuda_.build import get_split_kv_ext
 
 BATCH        = 1
 CTX          = 8192

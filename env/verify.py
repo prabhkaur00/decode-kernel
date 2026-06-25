@@ -3,7 +3,6 @@ import sys
 
 REQUIRED = [
     ("torch",        "torch"),
-    ("triton",       "triton"),
     ("flashinfer",   "flashinfer"),
     ("transformers", "transformers"),
     ("numpy",        "numpy"),

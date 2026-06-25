@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Detects CUDA version, installs matching FlashInfer wheel, verifies Triton,
+# Detects CUDA version, installs matching FlashInfer wheel,
 # and prints GPU name + compute capability.
 set -euo pipefail
 
@@ -32,26 +32,6 @@ pip install flashinfer==0.1.6 --extra-index-url "${FLASHINFER_INDEX}" --quiet
 pip install transformers==4.44.0 accelerate==0.32.0 \
             numpy==1.26.4 scipy==1.13.1 pandas==2.2.2 \
             matplotlib==3.9.0 prettytable==3.10.2 --quiet
-
-# ── Triton smoke test ──────────────────────────────────────────────────────
-python - <<'EOF'
-import torch, triton, triton.language as tl
-
-@triton.jit
-def _add(x_ptr, y_ptr, out_ptr, N: tl.constexpr):
-    i = tl.program_id(0)
-    x = tl.load(x_ptr + i)
-    y = tl.load(y_ptr + i)
-    tl.store(out_ptr + i, x + y)
-
-N = 128
-x = torch.ones(N, device="cuda")
-y = torch.ones(N, device="cuda")
-out = torch.empty(N, device="cuda")
-_add[(N,)](x, y, out, N=N)
-assert torch.allclose(out, torch.full((N,), 2.0, device="cuda")), "Triton smoke test FAILED"
-print("Triton smoke test passed")
-EOF
 
 # ── GPU info ───────────────────────────────────────────────────────────────
 python - <<'EOF'

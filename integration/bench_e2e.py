@@ -41,7 +41,7 @@ def start_server(backend: str, split_kv: int = 8) -> subprocess.Popen:
     env = os.environ.copy()
     env["HF_TOKEN"] = os.environ.get("HF_TOKEN", "")
     if backend == "split_kv":
-        env["SGLANG_ATTENTION_BACKEND"] = "split_kv_triton"
+        env["SGLANG_ATTENTION_BACKEND"] = "split_kv_cuda"
         env["SPLIT_KV"] = str(split_kv)
     # backend == "flashinfer" uses sglang defaults
 

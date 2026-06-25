@@ -6,7 +6,6 @@
 
 # Core ML stack
 torch==2.3.0
-triton==2.3.0
 flashinfer==0.1.6
 
 # Model loading

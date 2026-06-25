@@ -1,10 +1,11 @@
 """
 JIT-compiles the CUDA extensions using torch.utils.cpp_extension.load.
 
-Three entry points:
-  get_naive_ext()     — naive_kernel.cu only
-  get_split_kv_ext()  — split_kv_kernel.cu only (links nvToolsExt for NVTX3)
-  get_cuda_ext()      — original combined attention_ext.cu (backward compat)
+Entry points:
+  get_naive_ext()        — naive_kernel.cu only
+  get_split_kv_ext()     — split_kv_kernel.cu (v1, q-head-centric grid)
+  get_split_kv_v2_ext()  — split_kv_kernelv2.cu (v2, kv-head-centric grid)
+  get_cuda_ext()         — original combined attention_ext.cu (backward compat)
 
 First call triggers nvcc compilation (~30–60 s); subsequent calls in the
 same process return the cached module instantly.
@@ -14,9 +15,10 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-_naive_ext    = None
-_split_kv_ext = None
-_combined_ext = None
+_naive_ext       = None
+_split_kv_ext    = None
+_split_kv_v2_ext = None
+_combined_ext    = None
 
 
 def _sm_flag() -> str:
@@ -77,6 +79,30 @@ def get_split_kv_ext(verbose: bool = False):
     return _split_kv_ext
 
 
+def get_split_kv_v2_ext(verbose: bool = False):
+    """Returns the compiled split-KV v2 kernel extension (KV-head-centric grid)."""
+    global _split_kv_v2_ext
+    if _split_kv_v2_ext is not None:
+        return _split_kv_v2_ext
+
+    import torch
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA extension requires a GPU.")
+
+    from torch.utils.cpp_extension import load
+    src_dir = Path(__file__).resolve().parent
+
+    _split_kv_v2_ext = load(
+        name="split_kv_v2_attention_cuda",
+        sources=[str(src_dir / "split_kv_kernelv2.cu")],
+        extra_cuda_cflags=["-O3", "--use_fast_math", _sm_flag(), "-std=c++17"],
+        extra_cflags=["-O3", "-std=c++17"],
+        extra_ldflags=["-lnvToolsExt"],
+        verbose=verbose,
+    )
+    return _split_kv_v2_ext
+
+
 def get_cuda_ext(verbose: bool = False):
     """Returns the original combined extension (backward compat)."""
     global _combined_ext
@@ -111,6 +137,10 @@ if __name__ == "__main__":
     ext = get_naive_ext(verbose=True)
     print(f"naive: {[f for f in dir(ext) if not f.startswith('_')]}")
 
-    print("Building split-KV kernel …")
+    print("Building split-KV v1 kernel …")
     ext = get_split_kv_ext(verbose=True)
-    print(f"split_kv: {[f for f in dir(ext) if not f.startswith('_')]}")
+    print(f"split_kv_v1: {[f for f in dir(ext) if not f.startswith('_')]}")
+
+    print("Building split-KV v2 kernel …")
+    ext = get_split_kv_v2_ext(verbose=True)
+    print(f"split_kv_v2: {[f for f in dir(ext) if not f.startswith('_')]}")

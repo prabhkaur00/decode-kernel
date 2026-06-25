@@ -24,7 +24,7 @@ import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from kernel_split_kv import decode_attention_split_kv
+from attention import decode_attention
 from layout import build_block_table
 
 MODEL_ID    = "meta-llama/Llama-3.2-1B"
@@ -133,7 +133,7 @@ def verify_kernel_on_paged_kv(
     ref = ref.to(device)
 
     # Split-KV kernel
-    out = decode_attention_split_kv(
+    out = decode_attention(
         q, kv_data, kv_indptr, kv_indices, kv_last_page_len, split_kv=SPLIT_KV
     )
 

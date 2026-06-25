@@ -1,14 +1,15 @@
 """
 CUDA-backend microbenchmark for decode attention.
 
-Mirrors microbench.py but exercises the CUDA C++ kernels in src/cuda/
-instead of the Triton kernels.  The CUDA extension is JIT-compiled on
-first call (~30–60 s); subsequent runs use the on-disk cache.
+Exercises the CUDA C++ kernels in src/cuda_/.
+The CUDA extension is JIT-compiled on first call (~30-60 s); subsequent
+runs use the on-disk cache.
 
 Usage:
-    python bench/microbench_cuda.py
-    python bench/microbench_cuda.py --out results/microbench_cuda.csv
-    python bench/microbench_cuda.py --quick
+    python bench/microbench_cuda.py                          # v1 (default)
+    python bench/microbench_cuda.py --version v2             # v2 KV-head-centric
+    python bench/microbench_cuda.py --version v2 --quick
+    python bench/microbench_cuda.py --out results/my_run.csv
 """
 from __future__ import annotations
 
@@ -29,12 +30,19 @@ sys.path.insert(0, str(_SRC))
 from layout import synthesize
 from reference import reference_attention_paged
 
-# Load src/cuda/build.py by file path to avoid conflict with the top-level
+# Load src/cuda_/build.py by file path to avoid conflict with the top-level
 # 'cuda' namespace package installed by cuda-python in newer environments.
-_spec = importlib.util.spec_from_file_location("_cuda_build", _SRC / "cuda" / "build.py")
+_spec = importlib.util.spec_from_file_location("_cuda_build", _SRC / "cuda_" / "build.py")
 _mod  = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
-get_cuda_ext = _mod.get_cuda_ext
+
+# Registry: version string -> builder function for the split_kv extension.
+# The naive extension is shared across all versions.
+_SPLIT_KV_BUILDERS = {
+    "v1": _mod.get_split_kv_ext,
+    "v2": _mod.get_split_kv_v2_ext,
+}
+get_naive_ext = _mod.get_naive_ext
 
 try:
     import flashinfer
@@ -161,15 +169,18 @@ def run_sweep(
     split_kvs: List[int],
     implementations: List[str],
     out_path: str,
+    version: str,
 ):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA required for benchmarking")
 
-    ext = get_cuda_ext()
+    naive_ext = get_naive_ext()
+    split_kv_ext = _SPLIT_KV_BUILDERS[version]()
 
     peak_bw = get_peak_bw_gb_s()
     print(f"Peak HBM bandwidth: {peak_bw:.0f} GB/s")
-    print(f"GPU: {torch.cuda.get_device_name(0)}\n")
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"Kernel version: {version}\n")
 
     rows = []
 
@@ -183,9 +194,6 @@ def run_sweep(
                 head_dim=HEAD_DIM, page_size=PAGE_SIZE, dtype=DTYPE, device=DEVICE,
             )
 
-            # Reference on CPU: GQA expansion of (batch, ctx, num_kv_heads, head_dim)
-            # fp32 materializes to batch*ctx*num_q_heads*head_dim*4 bytes on GPU,
-            # which exceeds 40 GB at ctx=65536/batch=16.  CPU has no such limit.
             try:
                 ref = reference_attention_paged(
                     q.cpu(), kv_data.cpu(),
@@ -228,11 +236,11 @@ def run_sweep(
                             )
                             fn = lambda: fi_wrapper.forward(q, kv_data)
                     elif impl == "cuda_naive":
-                        fn = lambda: ext.decode_attention_naive(
+                        fn = lambda: naive_ext.decode_attention_naive(
                             q, kv_data, kv_indptr, kv_indices, kv_last_page_len
                         )
                     elif impl == "cuda_split_kv":
-                        fn = lambda skv_=skv: ext.decode_attention_split_kv(
+                        fn = lambda skv_=skv: split_kv_ext.decode_attention_split_kv(
                             q, kv_data, kv_indptr, kv_indices, kv_last_page_len, skv_
                         )
                     else:
@@ -277,11 +285,18 @@ def run_sweep(
 
 # ── CLI ────────────────────────────────────────────────────────────────────
 
+AVAILABLE_VERSIONS = sorted(_SPLIT_KV_BUILDERS.keys())
+
 def parse_args():
     parser = argparse.ArgumentParser(description="CUDA decode attention microbenchmark")
-    parser.add_argument("--out", default="results/microbench_cuda.csv")
+    parser.add_argument("--version", default="v1", choices=AVAILABLE_VERSIONS,
+                        help=f"Split-KV kernel version ({', '.join(AVAILABLE_VERSIONS)})")
+    parser.add_argument("--out", default=None,
+                        help="Output CSV path (default: results/microbench_cuda_<version>.csv)")
     parser.add_argument("--quick", action="store_true",
                         help="Small sweep for quick validation")
+    parser.add_argument("--split-kv-only", action="store_true",
+                        help="Only benchmark the split-KV kernel (skip naive and flashinfer)")
     return parser.parse_args()
 
 
@@ -298,6 +313,7 @@ QUICK_IMPLS           = ["cuda_naive", "cuda_split_kv"]
 
 if __name__ == "__main__":
     args = parse_args()
+    out_path = args.out or f"results/microbench_cuda_{args.version}.csv"
     if args.quick:
         ctxs, batches, splits, impls = (
             QUICK_CONTEXT_LENGTHS, QUICK_BATCH_SIZES,
@@ -308,4 +324,6 @@ if __name__ == "__main__":
             FULL_CONTEXT_LENGTHS, FULL_BATCH_SIZES,
             FULL_SPLIT_KVS, FULL_IMPLS,
         )
-    run_sweep(ctxs, batches, splits, impls, args.out)
+    if args.split_kv_only:
+        impls = ["cuda_split_kv"]
+    run_sweep(ctxs, batches, splits, impls, out_path, version=args.version)

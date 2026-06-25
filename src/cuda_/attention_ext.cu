@@ -1,8 +1,7 @@
 /**
  * attention_ext.cu — CUDA decode attention kernels + PyTorch extension bindings.
  *
- * Implements the same two algorithms as src/kernel_naive.py and
- * src/kernel_split_kv.py, but in CUDA C++.
+ * Implements two decode attention algorithms in CUDA C++.
  *
  * Key differences from the Triton version (see writeup/cuda_primer.md):
  *   - Explicit shared memory management via extern __shared__ float smem[]

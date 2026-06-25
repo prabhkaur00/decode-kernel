@@ -1,12 +1,12 @@
 """
-SGLang attention backend backed by the split-KV Triton kernel.
+SGLang attention backend backed by the split-KV CUDA kernel.
 
 Implements SGLang's `AttentionBackend` interface (sglang >= 0.2.x).
 The paged KV cache that SGLang passes in uses the FlashInfer NHD layout by
 default, so our kernel is layout-compatible with no data copies.
 
 Registration:
-    Set SGLANG_ATTENTION_BACKEND=split_kv_triton before launching the server,
+    Set SGLANG_ATTENTION_BACKEND=split_kv_cuda before launching the server,
     or call `register_backend()` programmatically before importing sglang.
 
 Part 2 requirements (see integration/README.md):
@@ -26,7 +26,7 @@ import torch
 # Allow import from repo root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from kernel_split_kv import decode_attention_split_kv
+from attention import decode_attention
 
 # Default split — tuned empirically on A100 for 32k context
 DEFAULT_SPLIT_KV = int(os.environ.get("SPLIT_KV", "8"))
@@ -47,9 +47,9 @@ def _import_sglang_base():
         return AttentionBackend
 
 
-class SplitKVTritonBackend(_import_sglang_base()):
+class SplitKVCudaBackend(_import_sglang_base()):
     """
-    SGLang attention backend that routes decode steps to the split-KV Triton
+    SGLang attention backend that routes decode steps to the split-KV CUDA
     kernel and falls back to FlashInfer for prefill.
 
     The split size can be tuned via the SPLIT_KV environment variable or
@@ -58,7 +58,6 @@ class SplitKVTritonBackend(_import_sglang_base()):
 
     def __init__(self, split_kv: int = DEFAULT_SPLIT_KV):
         self.split_kv = split_kv
-        self._scratch: dict = {}  # reused scratch buffers
         self._fi_wrapper = None   # FlashInfer wrapper for prefill
 
     # ── Prefill (standard FlashInfer) ──────────────────────────────────
@@ -81,7 +80,7 @@ class SplitKVTritonBackend(_import_sglang_base()):
                 q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
             ).squeeze(0)
 
-    # ── Decode (split-KV Triton) ────────────────────────────────────────
+    # ── Decode (split-KV CUDA) ──────────────────────────────────────────
 
     def forward(
         self,
@@ -96,44 +95,43 @@ class SplitKVTritonBackend(_import_sglang_base()):
         if is_prefill:
             return self._prefill_forward(q, kv_data, kv_indptr, **kwargs)
 
-        return decode_attention_split_kv(
+        return decode_attention(
             q, kv_data, kv_indptr, kv_indices, kv_last_page_len,
             split_kv=self.split_kv,
-            _scratch=self._scratch,
         )
 
     # ── SGLang hook ────────────────────────────────────────────────────
 
     @classmethod
     def name(cls) -> str:
-        return "split_kv_triton"
+        return "split_kv_cuda"
 
 
 # ── Registration ───────────────────────────────────────────────────────────
 
 def register_backend():
     """
-    Register SplitKVTritonBackend with SGLang's backend registry.
+    Register SplitKVCudaBackend with SGLang's backend registry.
     Call before importing sglang.server or launching the server subprocess.
     """
     try:
         from sglang.srt.layers.attention import register_attention_backend
-        register_attention_backend("split_kv_triton", SplitKVTritonBackend)
-        print("[split_kv_triton] Backend registered with SGLang.")
+        register_attention_backend("split_kv_cuda", SplitKVCudaBackend)
+        print("[split_kv_cuda] Backend registered with SGLang.")
     except ImportError:
-        print("[split_kv_triton] WARNING: sglang not installed; "
+        print("[split_kv_cuda] WARNING: sglang not installed; "
               "backend registration skipped.")
     except AttributeError:
         # Older sglang versions use a different registry mechanism
         try:
             import sglang.srt.layers.attention as attn_mod
-            attn_mod._BACKEND_REGISTRY["split_kv_triton"] = SplitKVTritonBackend
-            print("[split_kv_triton] Backend injected into registry (legacy path).")
+            attn_mod._BACKEND_REGISTRY["split_kv_cuda"] = SplitKVCudaBackend
+            print("[split_kv_cuda] Backend injected into registry (legacy path).")
         except Exception as e:
-            print(f"[split_kv_triton] Registration failed: {e}")
+            print(f"[split_kv_cuda] Registration failed: {e}")
 
 
 # ── Entry point for environment-variable–based auto-registration ───────────
 
-if os.environ.get("SGLANG_ATTENTION_BACKEND") == "split_kv_triton":
+if os.environ.get("SGLANG_ATTENTION_BACKEND") == "split_kv_cuda":
     register_backend()
