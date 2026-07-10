@@ -41,6 +41,7 @@ _spec.loader.exec_module(_mod)
 _SPLIT_KV_BUILDERS = {
     "v1": _mod.get_split_kv_ext,
     "v2": _mod.get_split_kv_v2_ext,
+    "pipelined": _mod.get_split_kv_pipelined_ext,
 }
 get_naive_ext = _mod.get_naive_ext
 

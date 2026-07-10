@@ -1,14 +1,21 @@
 """
 Plotting script for CUDA decode attention benchmarks.
 
-Generates 6 plots comparing FlashInfer, Split-KV v1, and Split-KV v2
-from two CSVs (one per kernel version).
+Generates 6 plots comparing FlashInfer against any number of CUDA kernel
+variants (naive, split-KV v1, v2, pipelined, ...), each supplied as its own
+microbench CSV.
 
 Usage:
+    # old default (v1 vs v2), unchanged
     python bench/plot_cuda.py
-    python bench/plot_cuda.py --v1 results/microbench_cuda_v1.csv \
-                              --v2 results/microbench_cuda_v2.csv \
-                              --out results/plots_cuda/
+
+    # any set of kernels, named however you like
+    python bench/plot_cuda.py \
+        --csv v1=results/microbench_cuda_v1.csv \
+        --csv v2=results/microbench_cuda_v2.csv \
+        --csv pipelined=results/microbench_cuda_pipelined.csv \
+        --baseline v1 --compare pipelined \
+        --out results/plots_cuda/
 """
 from __future__ import annotations
 
@@ -22,34 +29,68 @@ import pandas as pd
 plt.rcParams.update({"figure.dpi": 150, "font.size": 11,
                      "axes.grid": True, "grid.alpha": 0.3})
 
-COLORS = {
-    "flashinfer":       "#2196F3",
-    "cuda_split_kv_v1": "#F44336",
-    "cuda_split_kv_v2": "#4CAF50",
-}
-LABELS = {
-    "flashinfer":       "FlashInfer",
-    "cuda_split_kv_v1": "CUDA Split-KV v1",
-    "cuda_split_kv_v2": "CUDA Split-KV v2",
-}
+# Colors/labels for implementations that aren't a versioned split-kv kernel —
+# these are the same across every CSV, so they're assigned once and never
+# come out of the rotating PALETTE below.
+FIXED_COLORS = {"flashinfer": "#2196F3", "cuda_naive": "#9E9E9E"}
+FIXED_LABELS = {"flashinfer": "FlashInfer", "cuda_naive": "CUDA Naive"}
+
+# Rotating palette for however many cuda_split_kv_<name> variants show up.
+PALETTE = ["#F44336", "#4CAF50", "#FF9800", "#9C27B0",
+           "#00BCD4", "#795548", "#E91E63", "#3F51B5"]
+
+# Populated by build_style() once the CSVs are loaded; module-level so every
+# plot function below can keep referencing bare COLORS/LABELS as before.
+COLORS: dict[str, str] = dict(FIXED_COLORS)
+LABELS: dict[str, str] = dict(FIXED_LABELS)
 
 
-def load_and_merge(v1_path: str, v2_path: str) -> pd.DataFrame:
-    """Load v1 and v2 CSVs, relabel split_kv rows, drop cuda_naive, merge."""
-    df1 = pd.read_csv(v1_path)
-    df2 = pd.read_csv(v2_path)
+def build_style(implementations) -> tuple[dict[str, str], dict[str, str]]:
+    """Assign a stable color + label to every implementation name present."""
+    colors, labels = dict(FIXED_COLORS), dict(FIXED_LABELS)
+    split_kv_impls = sorted(i for i in implementations if i not in FIXED_COLORS)
+    for impl, color in zip(split_kv_impls, PALETTE):
+        colors[impl] = color
+        name = impl.removeprefix("cuda_split_kv_")
+        labels[impl] = f"CUDA Split-KV {name}"
+    if len(split_kv_impls) > len(PALETTE):
+        print(f"WARNING: {len(split_kv_impls)} split-kv variants but only "
+              f"{len(PALETTE)} palette colors; some will repeat.")
+    return colors, labels
 
-    # Keep flashinfer rows from v1 only (v2 doesn't have them)
-    fi = df1[df1["implementation"] == "flashinfer"].copy()
 
-    # Relabel split_kv rows per version
-    skv1 = df1[df1["implementation"] == "cuda_split_kv"].copy()
-    skv1["implementation"] = "cuda_split_kv_v1"
+def load_and_merge(kernels: dict[str, str]) -> pd.DataFrame:
+    """Load one CSV per kernel name, relabel split_kv rows per name, merge.
 
-    skv2 = df2[df2["implementation"] == "cuda_split_kv"].copy()
-    skv2["implementation"] = "cuda_split_kv_v2"
+    `kernels` maps an arbitrary display name (e.g. "v1", "pipelined") to a
+    microbench_cuda.py CSV path. Each CSV's "cuda_split_kv" rows are
+    relabeled to "cuda_split_kv_<name>" so they don't collide across kernels.
+    flashinfer/cuda_naive rows aren't versioned, so only the first CSV that
+    contains them contributes those rows.
+    """
+    dfs = []
+    have_flashinfer = have_naive = False
+    for name, path in kernels.items():
+        d = pd.read_csv(path)
 
-    df = pd.concat([fi, skv1, skv2], ignore_index=True)
+        if not have_flashinfer:
+            fi = d[d["implementation"] == "flashinfer"]
+            if not fi.empty:
+                dfs.append(fi.copy())
+                have_flashinfer = True
+
+        if not have_naive:
+            naive = d[d["implementation"] == "cuda_naive"]
+            if not naive.empty:
+                dfs.append(naive.copy())
+                have_naive = True
+
+        skv = d[d["implementation"] == "cuda_split_kv"].copy()
+        if not skv.empty:
+            skv["implementation"] = f"cuda_split_kv_{name}"
+            dfs.append(skv)
+
+    df = pd.concat(dfs, ignore_index=True)
     print(f"Merged: {len(df)} rows")
     print(f"Implementations: {sorted(df['implementation'].unique())}")
     return df
@@ -191,21 +232,26 @@ def plot4(df: pd.DataFrame, out_dir: Path,
     _save(fig, out_dir / "plot4_roofline.png")
 
 
-# ── Plot 5: speedup heatmap (v2 best vs v1 best) ──────────────────────────
+# ── Plot 5: speedup heatmap (compare kernel best vs baseline kernel best) ──
 
-def plot5(df: pd.DataFrame, out_dir: Path):
-    best_v1 = (df[df["implementation"] == "cuda_split_kv_v1"]
+def plot5(df: pd.DataFrame, out_dir: Path, baseline: str, compare: str):
+    """Speedup heatmap of `compare` vs `baseline`, both kernel names as
+    passed to --csv (e.g. baseline="v1", compare="pipelined")."""
+    impl_base = f"cuda_split_kv_{baseline}"
+    impl_cmp  = f"cuda_split_kv_{compare}"
+
+    best_base = (df[df["implementation"] == impl_base]
                .groupby(["context_length", "batch_size"])["latency_ms_p50"]
                .min().reset_index()
-               .rename(columns={"latency_ms_p50": "lat_v1"}))
+               .rename(columns={"latency_ms_p50": "lat_base"}))
 
-    best_v2 = (df[df["implementation"] == "cuda_split_kv_v2"]
+    best_cmp = (df[df["implementation"] == impl_cmp]
                .groupby(["context_length", "batch_size"])["latency_ms_p50"]
                .min().reset_index()
-               .rename(columns={"latency_ms_p50": "lat_v2"}))
+               .rename(columns={"latency_ms_p50": "lat_cmp"}))
 
-    merged = best_v1.merge(best_v2, on=["context_length", "batch_size"])
-    merged["speedup"] = merged["lat_v1"] / merged["lat_v2"]
+    merged = best_base.merge(best_cmp, on=["context_length", "batch_size"])
+    merged["speedup"] = merged["lat_base"] / merged["lat_cmp"]
 
     ctx_vals   = sorted(merged["context_length"].unique())
     batch_vals = sorted(merged["batch_size"].unique())
@@ -228,12 +274,13 @@ def plot5(df: pd.DataFrame, out_dir: Path):
     ax.set_yticklabels([f"{c//1024}k" for c in ctx_vals])
     ax.set_xlabel("Batch size")
     ax.set_ylabel("Context length")
-    plt.colorbar(im, ax=ax, label="Speedup (v1 / v2)")
+    plt.colorbar(im, ax=ax, label=f"Speedup ({baseline} / {compare})")
     for i in range(len(ctx_vals)):
         for j in range(len(batch_vals)):
             ax.text(j, i, f"{matrix[i,j]:.2f}x",
                     ha="center", va="center", fontsize=8, color="black")
-    fig.suptitle("Plot 5: Speedup — Split-KV v2 (best) vs v1 (best)  (A100)",
+    fig.suptitle(f"Plot 5: Speedup — {LABELS[impl_cmp]} (best) vs "
+                 f"{LABELS[impl_base]} (best)  (A100)",
                  fontweight="bold")
     fig.tight_layout()
     _save(fig, out_dir / "plot5_speedup_heatmap.png")
@@ -253,14 +300,14 @@ def plot6(df: pd.DataFrame, out_dir: Path):
     if len(batch_sizes) == 1:
         axes = [axes]
 
-    bar_impls = [("cuda_split_kv_v1", COLORS["cuda_split_kv_v1"]),
-                 ("cuda_split_kv_v2", COLORS["cuda_split_kv_v2"])]
+    bar_impls = [(impl, color) for impl, color in COLORS.items()
+                 if impl not in FIXED_COLORS]
 
     for ax, batch in zip(axes, batch_sizes):
         sub_fi = fi[fi["batch_size"] == batch].sort_values("context_length")
         ctx_labels = [f"{c//1024}k" for c in sub_fi["context_length"]]
         x = np.arange(len(sub_fi))
-        width = 0.35
+        width = 0.8 / max(len(bar_impls), 1)
 
         for offset, (impl, color) in enumerate(bar_impls):
             best = (df[df["implementation"] == impl]
@@ -271,7 +318,8 @@ def plot6(df: pd.DataFrame, out_dir: Path):
             merged["ratio"] = merged["lat_split"] / merged["lat_fi"]
             merged = merged.sort_values("context_length")
 
-            bars = ax.bar(x + (offset - 0.5) * width, merged["ratio"],
+            center_offset = offset - (len(bar_impls) - 1) / 2
+            bars = ax.bar(x + center_offset * width, merged["ratio"],
                           width, color=color, edgecolor="black", linewidth=0.5,
                           label=LABELS[impl])
             for rect, val in zip(bars, merged["ratio"]):
@@ -306,15 +354,29 @@ def _save(fig, path: Path):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--v1", default="microbench_cudav1.csv",
-                   help="Path to v1 CSV (contains flashinfer + cuda_naive + cuda_split_kv)")
-    p.add_argument("--v2", default="results/microbench_cuda_v2.csv",
-                   help="Path to v2 CSV (contains cuda_split_kv)")
+    p.add_argument("--v1", default=None,
+                   help="Shortcut for --csv v1=<path> (back-compat)")
+    p.add_argument("--v2", default=None,
+                   help="Shortcut for --csv v2=<path> (back-compat)")
+    p.add_argument("--csv", action="append", default=None, metavar="NAME=PATH",
+                   help="Kernel CSV to include, as name=path. Repeatable, e.g. "
+                        "--csv v1=results/microbench_cuda_v1.csv "
+                        "--csv pipelined=results/microbench_cuda_pipelined.csv. "
+                        "Each CSV's cuda_split_kv rows are relabeled "
+                        "cuda_split_kv_<name>; flashinfer/cuda_naive rows are "
+                        "taken from whichever CSV has them first.")
     p.add_argument("--out", default="results/plots_cuda")
     p.add_argument("--peak-compute", type=float, default=312.0,
                    help="GPU peak FP16 TFLOPs (default: 312 for A100)")
     p.add_argument("--peak-bw", type=float, default=2000.0,
                    help="GPU peak HBM bandwidth GB/s (default: 2000 for A100)")
+    p.add_argument("--baseline", default=None,
+                   help="Kernel name (as given to --csv) used as the "
+                        "denominator in Plot 5's speedup heatmap. Default: "
+                        "first kernel name in sorted order.")
+    p.add_argument("--compare", default=None,
+                   help="Kernel name compared against --baseline in Plot 5. "
+                        "Default: second kernel name in sorted order.")
     return p.parse_args()
 
 
@@ -323,7 +385,22 @@ if __name__ == "__main__":
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    df = load_and_merge(args.v1, args.v2)
+    kernels = {}
+    if args.v1:
+        kernels["v1"] = args.v1
+    if args.v2:
+        kernels["v2"] = args.v2
+    for item in args.csv or []:
+        if "=" not in item:
+            raise SystemExit(f"--csv must be NAME=PATH, got {item!r}")
+        name, path = item.split("=", 1)
+        kernels[name] = path
+    if not kernels:
+        kernels = {"v1": "results/microbench_cuda_v1.csv",
+                   "v2": "results/microbench_cuda_v2.csv"}
+
+    df = load_and_merge(kernels)
+    COLORS, LABELS = build_style(df["implementation"].unique())
     print(f"Context lengths: {sorted(df['context_length'].unique())}")
     print(f"Batch sizes:     {sorted(df['batch_size'].unique())}\n")
 
@@ -331,7 +408,17 @@ if __name__ == "__main__":
     plot2(df, out_dir)
     plot3(df, out_dir)
     plot4(df, out_dir, peak_compute_tflops=args.peak_compute, peak_bw_gb_s=args.peak_bw)
-    plot5(df, out_dir)
+
+    split_kv_names = sorted(kernels.keys())
+    baseline = args.baseline or (split_kv_names[0] if split_kv_names else None)
+    compare  = args.compare  or (split_kv_names[1] if len(split_kv_names) > 1 else None)
+    if baseline and compare and baseline != compare:
+        plot5(df, out_dir, baseline, compare)
+    else:
+        print(f"Skipping Plot 5 (speedup heatmap): need two distinct kernel "
+              f"names, got baseline={baseline!r} compare={compare!r}. "
+              f"Pass --baseline/--compare explicitly if you have 3+ kernels.")
+
     plot6(df, out_dir)
 
     print(f"\nAll plots saved to {out_dir}/")
