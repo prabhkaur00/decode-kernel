@@ -154,8 +154,10 @@ __global__ void decode_attn_partition_kernel(
     const int po_base =
         batch_idx * stride_pob + q_head_idx * stride_poh + split_idx * stride_pos;
     partial_O[po_base + tid] = acc;
-    partial_m[batch_idx * stride_pmb + q_head_idx * stride_pmh + split_idx] = m_i;
-    partial_l[batch_idx * stride_pmb + q_head_idx * stride_pmh + split_idx] = l_i;
+    if (tid == 0){
+        partial_m[batch_idx * stride_pmb + q_head_idx * stride_pmh + split_idx] = m_i;
+        partial_l[batch_idx * stride_pmb + q_head_idx * stride_pmh + split_idx] = l_i;
+    }
 }
 
 // ── Pass 2: reduction kernel ───────────────────────────────────────────────
