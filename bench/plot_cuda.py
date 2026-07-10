@@ -1,14 +1,14 @@
 """
-Standalone plotting script for microbench_cuda.csv.
+Plotting script for CUDA decode attention benchmarks.
 
-Generates 6 plots from a CSV produced by microbench_cuda.py.
-Works with any CSV that has columns:
-    implementation, context_length, batch_size, split_kv,
-    latency_ms_p50, achieved_bw_gb_s, peak_bw_gb_s, bw_pct_of_peak
+Generates 6 plots comparing FlashInfer, Split-KV v1, and Split-KV v2
+from two CSVs (one per kernel version).
 
 Usage:
-    python bench/plot_cuda.py --csv microbench_cuda.csv --out results/plots_cuda/
-    python bench/plot_cuda.py                              # uses defaults above
+    python bench/plot_cuda.py
+    python bench/plot_cuda.py --v1 results/microbench_cuda_v1.csv \
+                              --v2 results/microbench_cuda_v2.csv \
+                              --out results/plots_cuda/
 """
 from __future__ import annotations
 
@@ -23,15 +23,36 @@ plt.rcParams.update({"figure.dpi": 150, "font.size": 11,
                      "axes.grid": True, "grid.alpha": 0.3})
 
 COLORS = {
-    "flashinfer":    "#2196F3",
-    "cuda_naive":    "#F44336",
-    "cuda_split_kv": "#4CAF50",
+    "flashinfer":       "#2196F3",
+    "cuda_split_kv_v1": "#F44336",
+    "cuda_split_kv_v2": "#4CAF50",
 }
 LABELS = {
-    "flashinfer":    "FlashInfer",
-    "cuda_naive":    "CUDA Naive",
-    "cuda_split_kv": "CUDA Split-KV",
+    "flashinfer":       "FlashInfer",
+    "cuda_split_kv_v1": "CUDA Split-KV v1",
+    "cuda_split_kv_v2": "CUDA Split-KV v2",
 }
+
+
+def load_and_merge(v1_path: str, v2_path: str) -> pd.DataFrame:
+    """Load v1 and v2 CSVs, relabel split_kv rows, drop cuda_naive, merge."""
+    df1 = pd.read_csv(v1_path)
+    df2 = pd.read_csv(v2_path)
+
+    # Keep flashinfer rows from v1 only (v2 doesn't have them)
+    fi = df1[df1["implementation"] == "flashinfer"].copy()
+
+    # Relabel split_kv rows per version
+    skv1 = df1[df1["implementation"] == "cuda_split_kv"].copy()
+    skv1["implementation"] = "cuda_split_kv_v1"
+
+    skv2 = df2[df2["implementation"] == "cuda_split_kv"].copy()
+    skv2["implementation"] = "cuda_split_kv_v2"
+
+    df = pd.concat([fi, skv1, skv2], ignore_index=True)
+    print(f"Merged: {len(df)} rows")
+    print(f"Implementations: {sorted(df['implementation'].unique())}")
+    return df
 
 
 # ── Plot 1: latency vs SPLIT_KV ───────────────────────────────────────────
@@ -59,9 +80,6 @@ def plot1(df: pd.DataFrame, out_dir: Path):
                 if impl == "flashinfer":
                     ax.axhline(rows["latency_ms_p50"].values[0],
                                color=color, linestyle="--", linewidth=1.5, label=lbl)
-                elif impl == "cuda_naive":
-                    ax.axhline(rows["latency_ms_p50"].values[0],
-                               color=color, linestyle=":", linewidth=1.5, label=lbl)
                 else:
                     r = rows.sort_values("split_kv")
                     ax.plot(r["split_kv"], r["latency_ms_p50"],
@@ -70,9 +88,10 @@ def plot1(df: pd.DataFrame, out_dir: Path):
             ax.set_title(f"ctx={ctx//1024}k  B={batch}", fontsize=9)
             ax.set_xlabel("SPLIT_KV", fontsize=8)
             ax.set_ylabel("Latency (ms)", fontsize=8)
-            ax.set_xticks(sorted(df["split_kv"].unique()))
+            split_ticks = sorted(df[df["implementation"] != "flashinfer"]["split_kv"].unique())
+            ax.set_xticks(split_ticks)
             ax.tick_params(labelsize=7)
-            ax.legend(fontsize=7)
+            ax.legend(fontsize=6)
 
     fig.suptitle("Plot 1: Latency vs SPLIT_KV  (A100)", fontweight="bold")
     fig.tight_layout()
@@ -172,20 +191,21 @@ def plot4(df: pd.DataFrame, out_dir: Path,
     _save(fig, out_dir / "plot4_roofline.png")
 
 
-# ── Plot 5: speedup heatmap (split-KV best vs naive) ─────────────────────
+# ── Plot 5: speedup heatmap (v2 best vs v1 best) ──────────────────────────
 
 def plot5(df: pd.DataFrame, out_dir: Path):
-    naive = df[df["implementation"] == "cuda_naive"][
-        ["context_length", "batch_size", "latency_ms_p50"]
-    ].rename(columns={"latency_ms_p50": "lat_naive"})
+    best_v1 = (df[df["implementation"] == "cuda_split_kv_v1"]
+               .groupby(["context_length", "batch_size"])["latency_ms_p50"]
+               .min().reset_index()
+               .rename(columns={"latency_ms_p50": "lat_v1"}))
 
-    best_split = (df[df["implementation"] == "cuda_split_kv"]
-                  .groupby(["context_length", "batch_size"])["latency_ms_p50"]
-                  .min().reset_index()
-                  .rename(columns={"latency_ms_p50": "lat_split"}))
+    best_v2 = (df[df["implementation"] == "cuda_split_kv_v2"]
+               .groupby(["context_length", "batch_size"])["latency_ms_p50"]
+               .min().reset_index()
+               .rename(columns={"latency_ms_p50": "lat_v2"}))
 
-    merged = naive.merge(best_split, on=["context_length", "batch_size"])
-    merged["speedup"] = merged["lat_naive"] / merged["lat_split"]
+    merged = best_v1.merge(best_v2, on=["context_length", "batch_size"])
+    merged["speedup"] = merged["lat_v1"] / merged["lat_v2"]
 
     ctx_vals   = sorted(merged["context_length"].unique())
     batch_vals = sorted(merged["batch_size"].unique())
@@ -197,21 +217,23 @@ def plot5(df: pd.DataFrame, out_dir: Path):
             if not row.empty:
                 matrix[i, j] = row["speedup"].values[0]
 
+    vmin = min(matrix.min(), 0.99)
     vmax = max(matrix.max(), 1.01)
     fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(matrix, cmap="RdYlGn", aspect="auto", vmin=1.0, vmax=vmax + 0.1)
+    im = ax.imshow(matrix, cmap="RdYlGn", aspect="auto",
+                   vmin=vmin - 0.05, vmax=vmax + 0.05)
     ax.set_xticks(range(len(batch_vals)))
     ax.set_xticklabels([f"B={b}" for b in batch_vals])
     ax.set_yticks(range(len(ctx_vals)))
     ax.set_yticklabels([f"{c//1024}k" for c in ctx_vals])
     ax.set_xlabel("Batch size")
     ax.set_ylabel("Context length")
-    plt.colorbar(im, ax=ax, label="Speedup vs CUDA Naive")
+    plt.colorbar(im, ax=ax, label="Speedup (v1 / v2)")
     for i in range(len(ctx_vals)):
         for j in range(len(batch_vals)):
             ax.text(j, i, f"{matrix[i,j]:.2f}x",
                     ha="center", va="center", fontsize=8, color="black")
-    fig.suptitle("Plot 5: Speedup — CUDA Split-KV (best) vs CUDA Naive  (A100)",
+    fig.suptitle("Plot 5: Speedup — Split-KV v2 (best) vs v1 (best)  (A100)",
                  fontweight="bold")
     fig.tight_layout()
     _save(fig, out_dir / "plot5_speedup_heatmap.png")
@@ -225,45 +247,48 @@ def plot6(df: pd.DataFrame, out_dir: Path):
           .mean().reset_index()
           .rename(columns={"latency_ms_p50": "lat_fi"}))
 
-    best_split = (df[df["implementation"] == "cuda_split_kv"]
-                  .groupby(["context_length", "batch_size"])["latency_ms_p50"]
-                  .min().reset_index()
-                  .rename(columns={"latency_ms_p50": "lat_split"}))
-
-    merged = fi.merge(best_split, on=["context_length", "batch_size"])
-    merged["ratio"] = merged["lat_split"] / merged["lat_fi"]
-    merged = merged.sort_values(["context_length", "batch_size"])
-
-    batch_sizes = sorted(merged["batch_size"].unique())
-    ctx_labels  = [f"{c//1024}k" for c in sorted(merged["context_length"].unique())]
-
+    batch_sizes = sorted(fi["batch_size"].unique())
     fig, axes = plt.subplots(1, len(batch_sizes),
                              figsize=(5 * len(batch_sizes), 4), sharey=True)
     if len(batch_sizes) == 1:
         axes = [axes]
 
+    bar_impls = [("cuda_split_kv_v1", COLORS["cuda_split_kv_v1"]),
+                 ("cuda_split_kv_v2", COLORS["cuda_split_kv_v2"])]
+
     for ax, batch in zip(axes, batch_sizes):
-        sub = merged[merged["batch_size"] == batch].sort_values("context_length")
-        x = range(len(sub))
-        bars = ax.bar(x, sub["ratio"],
-                      color=[COLORS["cuda_split_kv"] if r <= 2 else "#FF9800"
-                             for r in sub["ratio"]],
-                      edgecolor="black", linewidth=0.5)
+        sub_fi = fi[fi["batch_size"] == batch].sort_values("context_length")
+        ctx_labels = [f"{c//1024}k" for c in sub_fi["context_length"]]
+        x = np.arange(len(sub_fi))
+        width = 0.35
+
+        for offset, (impl, color) in enumerate(bar_impls):
+            best = (df[df["implementation"] == impl]
+                    .groupby(["context_length", "batch_size"])["latency_ms_p50"]
+                    .min().reset_index()
+                    .rename(columns={"latency_ms_p50": "lat_split"}))
+            merged = sub_fi.merge(best, on=["context_length", "batch_size"])
+            merged["ratio"] = merged["lat_split"] / merged["lat_fi"]
+            merged = merged.sort_values("context_length")
+
+            bars = ax.bar(x + (offset - 0.5) * width, merged["ratio"],
+                          width, color=color, edgecolor="black", linewidth=0.5,
+                          label=LABELS[impl])
+            for rect, val in zip(bars, merged["ratio"]):
+                ax.text(rect.get_x() + rect.get_width() / 2,
+                        rect.get_height() + 0.02,
+                        f"{val:.1f}×", ha="center", va="bottom", fontsize=7)
+
         ax.axhline(1.0, color="black", linestyle="--", linewidth=1.2,
                    label="Parity with FlashInfer")
-        for rect, val in zip(bars, sub["ratio"]):
-            ax.text(rect.get_x() + rect.get_width() / 2,
-                    rect.get_height() + 0.02,
-                    f"{val:.1f}×", ha="center", va="bottom", fontsize=8)
-        ax.set_xticks(list(x))
-        ax.set_xticklabels([f"{c//1024}k" for c in sub["context_length"]],
-                           rotation=45, ha="right", fontsize=8)
+        ax.set_xticks(x)
+        ax.set_xticklabels(ctx_labels, rotation=45, ha="right", fontsize=8)
         ax.set_xlabel("Context length")
         ax.set_ylabel("Latency ratio (Split-KV / FlashInfer)")
         ax.set_title(f"batch={batch}")
-        ax.legend(fontsize=8)
+        ax.legend(fontsize=7)
 
-    fig.suptitle("Plot 6: CUDA Split-KV Gap to FlashInfer  (A100, optimal SPLIT_KV)",
+    fig.suptitle("Plot 6: Gap to FlashInfer  (A100, optimal SPLIT_KV)",
                  fontweight="bold")
     fig.tight_layout()
     _save(fig, out_dir / "plot6_gap_to_flashinfer.png")
@@ -281,7 +306,10 @@ def _save(fig, path: Path):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--csv", default="microbench_cuda.csv")
+    p.add_argument("--v1", default="microbench_cudav1.csv",
+                   help="Path to v1 CSV (contains flashinfer + cuda_naive + cuda_split_kv)")
+    p.add_argument("--v2", default="results/microbench_cuda_v2.csv",
+                   help="Path to v2 CSV (contains cuda_split_kv)")
     p.add_argument("--out", default="results/plots_cuda")
     p.add_argument("--peak-compute", type=float, default=312.0,
                    help="GPU peak FP16 TFLOPs (default: 312 for A100)")
@@ -295,9 +323,7 @@ if __name__ == "__main__":
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    df = pd.read_csv(args.csv)
-    print(f"Loaded {len(df)} rows from {args.csv}")
-    print(f"Implementations: {sorted(df['implementation'].unique())}")
+    df = load_and_merge(args.v1, args.v2)
     print(f"Context lengths: {sorted(df['context_length'].unique())}")
     print(f"Batch sizes:     {sorted(df['batch_size'].unique())}\n")
 
