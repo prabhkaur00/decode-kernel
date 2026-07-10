@@ -15,10 +15,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-_naive_ext       = None
-_split_kv_ext    = None
-_split_kv_v2_ext = None
-_combined_ext    = None
+_naive_ext              = None
+_split_kv_ext           = None
+_split_kv_v2_ext        = None
+_split_kv_pipelined_ext = None
+_combined_ext           = None
 
 
 def _sm_flag() -> str:
@@ -103,6 +104,40 @@ def get_split_kv_v2_ext(verbose: bool = False):
     return _split_kv_v2_ext
 
 
+def get_split_kv_pipelined_ext(verbose: bool = False):
+    """Returns the compiled split-KV pipelined-kernel extension (singleton).
+
+    Uses cp.async (LDGSTS), which requires SM 80+ (Ampere or newer).
+    """
+    global _split_kv_pipelined_ext
+    if _split_kv_pipelined_ext is not None:
+        return _split_kv_pipelined_ext
+
+    import torch
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA extension requires a GPU.")
+
+    props = torch.cuda.get_device_properties(0)
+    if props.major < 8:
+        raise RuntimeError(
+            f"split_kv_kernel_pipelined.cu requires SM 80+ (Ampere+) for "
+            f"cp.async; detected sm_{props.major}{props.minor}."
+        )
+
+    from torch.utils.cpp_extension import load
+    src_dir = Path(__file__).resolve().parent
+
+    _split_kv_pipelined_ext = load(
+        name="split_kv_pipelined_attention_cuda",
+        sources=[str(src_dir / "split_kv_kernel_pipelined.cu")],
+        extra_cuda_cflags=["-O3", "--use_fast_math", _sm_flag(), "-std=c++17"],
+        extra_cflags=["-O3", "-std=c++17"],
+        extra_ldflags=["-lnvToolsExt"],
+        verbose=verbose,
+    )
+    return _split_kv_pipelined_ext
+
+
 def get_cuda_ext(verbose: bool = False):
     """Returns the original combined extension (backward compat)."""
     global _combined_ext
@@ -144,3 +179,7 @@ if __name__ == "__main__":
     print("Building split-KV v2 kernel …")
     ext = get_split_kv_v2_ext(verbose=True)
     print(f"split_kv_v2: {[f for f in dir(ext) if not f.startswith('_')]}")
+
+    print("Building split-KV pipelined kernel …")
+    ext = get_split_kv_pipelined_ext(verbose=True)
+    print(f"split_kv_pipelined: {[f for f in dir(ext) if not f.startswith('_')]}")
