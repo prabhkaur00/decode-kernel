@@ -149,7 +149,7 @@ __global__ void decode_attn_partition_kernel_pipelined(
     for (int p = 0, fetch = NUM_STAGES; p < my_num_pages; p++, fetch++) {
         // Wait until only NUM_STAGES-1 commits are still in flight,
         // i.e. this page's data has landed in shared memory.
-        __pipeline_wait_prior<NUM_STAGES - 1>();
+        __pipeline_wait_prior(NUM_STAGES - 1);
         __syncthreads();
 
         const int this_valid = valid_of(p);
@@ -226,7 +226,7 @@ __global__ void decode_attn_partition_kernel_pipelined(
     }
 
     // Drain any remaining commits so no in-flight LDGSTS outlives the kernel
-    __pipeline_wait_prior<0>();
+    __pipeline_wait_prior(0);
 
     // ── Write partials ──────────────────────────────────────────────────
     const int po_base =
