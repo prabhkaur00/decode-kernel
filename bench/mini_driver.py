@@ -31,6 +31,12 @@ Usage (from repo root, on a GPU runtime):
         -o decode_ncu_pipelined -f \
         python bench/mini_driver.py --kernel split_kv_pipelined --batch 16 --ctx 65536 --split-kv 16
 
+    # v4 kernel (pipelined + reduced register pressure), same shape (requires SM 80+)
+    ncu --set full --kernel-name regex:decode \
+        --launch-skip 0 --launch-count 2 \
+        -o decode_ncu_v4 -f \
+        python bench/mini_driver.py --kernel split_kv_v4 --batch 16 --ctx 65536 --split-kv 16
+
     # naive kernel launches a single "decode" kernel, so use --launch-count 1
     ncu --set full --kernel-name regex:decode \
         --launch-skip 0 --launch-count 1 \
@@ -53,6 +59,7 @@ from cuda_.build import (
     get_split_kv_ext,
     get_split_kv_v2_ext,
     get_split_kv_pipelined_ext,
+    get_split_kv_v4_ext,
 )
 
 NUM_Q_HEADS  = 32
@@ -71,6 +78,7 @@ KERNELS = {
     "split_kv":           (get_split_kv_ext,            True),
     "split_kv_v2":        (get_split_kv_v2_ext,         True),
     "split_kv_pipelined": (get_split_kv_pipelined_ext,  True),
+    "split_kv_v4":        (get_split_kv_v4_ext,         True),
 }
 
 
