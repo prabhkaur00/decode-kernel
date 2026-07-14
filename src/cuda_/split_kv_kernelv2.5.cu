@@ -1,21 +1,27 @@
 /**
  * split_kv_kernelv2.5.cu — Split-KV decode attention, KV-head-centric grid,
- * with QK scores held in shared memory instead of a per-thread register array.
+ * with per-g score/softmax/accumulate fusion and QK scores in shared memory.
  *
  * Same algorithmic reuse as v2 (one K/V page load serves all GROUP_SIZE
- * query heads in the group), but the intermediate QK scores that must
- * survive the K->V shared-memory buffer swap are now held in a small
- * dedicated shared array (qk_all) instead of a per-thread register array.
+ * query heads in the group), but restructured so K and V tiles are both
+ * loaded into shared memory up front (SmemLayoutV2_5, two KV-sized
+ * regions instead of v1/v2's single reused region), and each g's
+ * score -> softmax -> accumulate sequence completes before moving to the
+ * next g. QK scores for the g currently in flight live in a single
+ * PAGE_SIZE-float shared buffer (sm.qk) rather than a per-thread
+ * qk_scores[GROUP_SIZE][PAGE_SIZE] register array.
  *
  * Register savings vs v2: removes qk_scores[GROUP_SIZE][PAGE_SIZE] (that's
  * GROUP_SIZE*PAGE_SIZE registers/thread, e.g. 64 regs/thread @ GROUP_SIZE=4,
- * PAGE_SIZE=16) at the cost of GROUP_SIZE*PAGE_SIZE floats of *shared* memory
- * total for the whole block (e.g. 256 bytes) — not per thread.
+ * PAGE_SIZE=16). Cost: an extra PAGE_SIZE*HEAD_DIM floats of *shared*
+ * memory for the block (the V tile, now resident alongside K instead of
+ * reusing its region) — not per thread.
  *
  * Pass 1 — Partition kernel
  *   Grid : (batch, num_kv_heads, split_kv)
  *   Block: HEAD_DIM threads.
- *   Same grid/reuse pattern as v2; QK scores live in shared memory (qk_all)
+ *   Same grid/reuse pattern as v2; K and V tiles both resident in shared
+ *   memory, QK scores for the in-flight g held in a small shared buffer
  *   rather than per-thread registers.
  *
  * Pass 2 — Reduction kernel (unchanged from v1/v2)
@@ -27,6 +33,43 @@
 #include "decode_attn.cuh"
 #include <torch/extension.h>
 #include <nvToolsExt.h>
+
+// ── Shared memory layout (v2.5-specific) ──────────────────────────────────
+//
+// K and V tiles are both resident at once here (unlike v1/v2's SmemLayout,
+// which reuses one KV-sized region for K then V in turn), because the
+// per-g fused score/softmax/accumulate loop below needs V available
+// immediately after computing that g's scores — V can't wait until all
+// g's scores are done.
+//
+//   Region 0 : kv    [PAGE_SIZE * HEAD_DIM] floats — K tile
+//   Region 1 : kv_v  [PAGE_SIZE * HEAD_DIM] floats — V tile
+//   Region 2 : warp  [NUM_WARPS * PAGE_SIZE] floats — inter-warp partial QK sums
+//   Region 3 : qk    [PAGE_SIZE]             floats — this g's QK scores
+
+template<int HEAD_DIM, int PAGE_SIZE>
+struct SmemLayoutV2_5 {
+    static constexpr int NUM_WARPS   = HEAD_DIM / 32;
+    static constexpr int KV_FLOATS   = PAGE_SIZE * HEAD_DIM;
+    static constexpr int WARP_FLOATS = NUM_WARPS * PAGE_SIZE;
+    static constexpr int QK_FLOATS   = PAGE_SIZE;
+    static constexpr int TOTAL_FLOATS =
+        KV_FLOATS  /* kv */ + KV_FLOATS /* kv_v */ + WARP_FLOATS + QK_FLOATS;
+    static constexpr int BYTES = TOTAL_FLOATS * sizeof(float);
+
+    float* kv;    // K tile
+    float* kv_v;  // V tile
+    float* warp;  // kv_v + KV_FLOATS
+    float* qk;    // warp + WARP_FLOATS
+
+    __device__ __forceinline__
+    SmemLayoutV2_5(float* smem_base)
+        : kv   (smem_base),
+          kv_v (smem_base + KV_FLOATS),
+          warp (smem_base + 2 * KV_FLOATS),
+          qk   (smem_base + 2 * KV_FLOATS + WARP_FLOATS)
+    {}
+};
 
 // ── Pass 1: partition kernel (v2.5 — group-fused, QK scores in shared mem) ─
 
@@ -57,15 +100,11 @@ __global__ void decode_attn_partition_v2_5_kernel(
     const int lane_id     = tid % 32;
 
     extern __shared__ float smem[];
-    SmemLayout<HEAD_DIM, PAGE_SIZE> sm(smem);
+    SmemLayoutV2_5<HEAD_DIM, PAGE_SIZE> sm(smem);
 
-    // Extra shared buffer for QK scores across all GROUP_SIZE heads,
-    // placed right after SmemLayout's region. Replaces the old
-    // per-thread `qk_scores[GROUP_SIZE][PAGE_SIZE]` register array.
-    float* qk_all = smem + (SmemLayout<HEAD_DIM, PAGE_SIZE>::BYTES / sizeof(float));
-
-    // Load all group_size Q vectors into registers (unchanged — this is
-    // small: GROUP_SIZE registers, not GROUP_SIZE*PAGE_SIZE)
+    // Load all group_size Q vectors into registers.
+    // (Kept as-is: this is only GROUP_SIZE floats, not the source of the
+    // register blowup — qk_scores[GROUP_SIZE][PAGE_SIZE] was.)
     float q_vals[GROUP_SIZE];
     #pragma unroll
     for (int g = 0; g < GROUP_SIZE; g++) {
@@ -85,8 +124,7 @@ __global__ void decode_attn_partition_v2_5_kernel(
     const int split_end       = min(split_start + pages_per_split, num_pages);
     const int my_num_pages    = split_end - split_start;
 
-    // Per-q_head online softmax state — unchanged, scales with GROUP_SIZE
-    // only (not GROUP_SIZE*PAGE_SIZE), so this stays cheap.
+    // Per-q_head online softmax state
     float m_i[GROUP_SIZE];
     float l_i[GROUP_SIZE];
     float acc[GROUP_SIZE];
@@ -114,9 +152,28 @@ __global__ void decode_attn_partition_v2_5_kernel(
         }
         __syncthreads();
 
-        // ── QK scores for all GROUP_SIZE heads, written straight into
-        //    shared memory (qk_all) instead of a per-thread register
-        //    array. This is the only structural change from v2.
+        // ── Load V page into a SEPARATE smem region up front ─────────
+        // v2 reused sm.kv for both K and V (load K, consume K, load V,
+        // consume V). That's fine when scores for all g are computed
+        // before V is needed. Here we fuse per-g, so each g's
+        // softmax+accumulate step needs V immediately after computing
+        // that g's scores — V must already be resident. We stage it in
+        // sm.kv_v (a second PAGE_SIZE*HEAD_DIM buffer) right after K,
+        // both loaded before any score computation begins.
+        {
+            const __half* v_base =
+                KV + page * stride_kvp + 1 * stride_kvr + kv_head_idx * stride_kvh;
+            #pragma unroll
+            for (int tok = 0; tok < PAGE_SIZE; tok++)
+                sm.kv_v[tok * HEAD_DIM + tid] = (tok < valid)
+                    ? __half2float(v_base[tok * stride_kvs + tid]) : 0.0f;
+        }
+        __syncthreads();
+
+        // ── Fused per-g: score compute -> softmax -> accumulate ──────
+        // Only one PAGE_SIZE (16-float) qk buffer live at a time,
+        // instead of qk_scores[GROUP_SIZE][PAGE_SIZE] (64 floats) held
+        // simultaneously across the whole page as in v2.
         #pragma unroll
         for (int g = 0; g < GROUP_SIZE; g++) {
             float parts[PAGE_SIZE];
@@ -136,63 +193,43 @@ __global__ void decode_attn_partition_v2_5_kernel(
                 #pragma unroll
                 for (int w = 0; w < NUM_WARPS; w++)
                     score += sm.warp[w * PAGE_SIZE + tid];
-                // Written directly to this head's slice of qk_all —
-                // no register copy, no per-thread storage.
-                qk_all[g * PAGE_SIZE + tid] = (tid < valid) ? score : -1e9f;
+                sm.qk[tid] = (tid < valid) ? score : -1e9f;
             }
-            __syncthreads(); // guards sm.warp overwrite by next g AND
-                              // publishes qk_all[g] to all threads
-        }
+            __syncthreads();
 
-        // ── Load V page (once for all q_heads) ──────────────────────
-        {
-            const __half* v_base =
-                KV + page * stride_kvp + 1 * stride_kvr + kv_head_idx * stride_kvh;
-            #pragma unroll
-            for (int tok = 0; tok < PAGE_SIZE; tok++)
-                sm.kv[tok * HEAD_DIM + tid] = (tok < valid)
-                    ? __half2float(v_base[tok * stride_kvs + tid]) : 0.0f;
-        }
-        __syncthreads();
-
-        // ── Softmax + accumulate for each q_head ─────────────────────
-        // Reads qk_all[g][*] directly from shared memory — every thread
-        // reads the same small shared array rather than its own private
-        // register copy. This is a broadcast read, which is cheap and
-        // conflict-free on the shared memory crossbar.
-        #pragma unroll
-        for (int g = 0; g < GROUP_SIZE; g++) {
+            // qk[] now holds this g's scores only — read immediately,
+            // no cross-g buffering.
             float m_block = -1e9f;
             #pragma unroll
             for (int tok = 0; tok < PAGE_SIZE; tok++)
-                m_block = fmaxf(m_block, qk_all[g * PAGE_SIZE + tok]);
+                m_block = fmaxf(m_block, sm.qk[tok]);
 
             float exp_weights[PAGE_SIZE];
             float l_block = 0.0f;
             #pragma unroll
             for (int tok = 0; tok < PAGE_SIZE; tok++) {
-                exp_weights[tok] = expf(qk_all[g * PAGE_SIZE + tok] - m_block);
+                exp_weights[tok] = expf(sm.qk[tok] - m_block);
                 l_block += exp_weights[tok];
             }
 
             float acc_block = 0.0f;
             #pragma unroll
             for (int tok = 0; tok < PAGE_SIZE; tok++)
-                acc_block += exp_weights[tok] * sm.kv[tok * HEAD_DIM + tid];
+                acc_block += exp_weights[tok] * sm.kv_v[tok * HEAD_DIM + tid];
 
             const float m_new = fmaxf(m_i[g], m_block);
-            const float alpha  = expf(m_i[g]   - m_new);
-            const float beta   = expf(m_block  - m_new);
+            const float alpha = expf(m_i[g]  - m_new);
+            const float beta  = expf(m_block - m_new);
             l_i[g] = alpha * l_i[g] + beta * l_block;
             acc[g] = alpha * acc[g] + beta * acc_block;
             m_i[g] = m_new;
+
+            // sm.warp[] and sm.qk[] are about to be overwritten by the
+            // next g's score computation — the __syncthreads() at the
+            // top of next iteration's warp-reduction write already
+            // guards that, so no extra barrier needed here beyond what
+            // the two syncs above already provide.
         }
-        // Note: no extra __syncthreads() needed here before the next
-        // page iteration's K load — that load doesn't touch qk_all, and
-        // the existing sync at the top of the next K-load section (or at
-        // loop entry via the K-load's own __syncthreads()) covers reuse
-        // of sm.kv. qk_all slices are freshly overwritten per-g at the
-        // top of next iteration's QK phase, guarded by the sync there.
     }
 
     // ── Write partial results for all q_heads in the group ───────────
@@ -252,9 +289,9 @@ __global__ void decode_attn_reduce_kernel(
 
 // ── Host-side launchers ──────────────────────────────────────────────────
 //
-// The only change from v2's partition launcher: dynamic shared memory must
-// now include room for qk_all (GROUP_SIZE * PAGE_SIZE floats), appended
-// after SmemLayout's own region.
+// Dynamic shared memory is sized from SmemLayoutV2_5, which holds K and V
+// tiles simultaneously (unlike v1/v2's SmemLayout, which reuses one
+// KV-sized region for both) — see the struct's comment above for why.
 
 template<int HEAD_DIM, int GROUP_SIZE>
 static void launch_partition_v2_5_hd(
@@ -270,9 +307,7 @@ static void launch_partition_v2_5_hd(
 ) {
     constexpr int PAGE_SIZE = 16;
 
-    // Base SmemLayout region + qk_all region (GROUP_SIZE * PAGE_SIZE floats)
-    const int smem = SmemLayout<HEAD_DIM, PAGE_SIZE>::BYTES
-                    + GROUP_SIZE * PAGE_SIZE * sizeof(float);
+    const int smem = SmemLayoutV2_5<HEAD_DIM, PAGE_SIZE>::BYTES;
 
     // If this exceeds the default 48KB static limit, opt in explicitly:
     // cudaFuncSetAttribute(decode_attn_partition_v2_5_kernel<HEAD_DIM, PAGE_SIZE, GROUP_SIZE>,
