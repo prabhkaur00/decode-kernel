@@ -8,6 +8,9 @@ runs use the on-disk cache.
 Usage:
     python bench/microbench_cuda.py                          # v1 (default)
     python bench/microbench_cuda.py --version v2             # v2 KV-head-centric
+    python bench/microbench_cuda.py --version v2_5           # v2.5 group-fused, shared-mem QK
+    python bench/microbench_cuda.py --version pipelined      # v3 cp.async double-buffered
+    python bench/microbench_cuda.py --version v3_5           # v3.5 pipelined + group-fused
     python bench/microbench_cuda.py --version v4             # v4 pipelined, low-register
     python bench/microbench_cuda.py --version v2 --quick
     python bench/microbench_cuda.py --out results/my_run.csv
@@ -42,7 +45,9 @@ _spec.loader.exec_module(_mod)
 _SPLIT_KV_BUILDERS = {
     "v1": _mod.get_split_kv_ext,
     "v2": _mod.get_split_kv_v2_ext,
+    "v2_5": _mod.get_split_kv_v2_5_ext,
     "pipelined": _mod.get_split_kv_pipelined_ext,
+    "v3_5": _mod.get_split_kv_v3_5_ext,
     "v4": _mod.get_split_kv_v4_ext,
 }
 get_naive_ext = _mod.get_naive_ext
