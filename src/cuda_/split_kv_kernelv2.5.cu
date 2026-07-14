@@ -1,21 +1,24 @@
 /**
- * split_kv_kernelv2.cu — Split-KV decode attention, KV-head-centric grid.
+ * split_kv_kernelv2.5.cu — Split-KV decode attention, KV-head-centric grid,
+ * with QK scores held in shared memory instead of a per-thread register array.
  *
- * v1 launches one CTA per (batch, q_head, split) — num_q_heads CTAs in Y.
- * v2 launches one CTA per (batch, kv_head, split) — num_kv_heads CTAs in Y.
- * Each CTA loops over group_size q_heads, reusing the K/V tile from shared
- * memory across all q_heads in the group. This reduces global KV reads by
- * ~group_size×.
+ * Same algorithmic reuse as v2 (one K/V page load serves all GROUP_SIZE
+ * query heads in the group), but the intermediate QK scores that must
+ * survive the K->V shared-memory buffer swap are now held in a small
+ * dedicated shared array (qk_all) instead of a per-thread register array.
+ *
+ * Register savings vs v2: removes qk_scores[GROUP_SIZE][PAGE_SIZE] (that's
+ * GROUP_SIZE*PAGE_SIZE registers/thread, e.g. 64 regs/thread @ GROUP_SIZE=4,
+ * PAGE_SIZE=16) at the cost of GROUP_SIZE*PAGE_SIZE floats of *shared* memory
+ * total for the whole block (e.g. 256 bytes) — not per thread.
  *
  * Pass 1 — Partition kernel
  *   Grid : (batch, num_kv_heads, split_kv)
  *   Block: HEAD_DIM threads.
- *   Each CTA loads its KV page slice once, then loops over group_size
- *   q_heads, computing independent softmax partials per q_head.
- *   Writes partial (m_i, l_i, O_i) to fp32 scratch buffers indexed by
- *   the full q_head index.
+ *   Same grid/reuse pattern as v2; QK scores live in shared memory (qk_all)
+ *   rather than per-thread registers.
  *
- * Pass 2 — Reduction kernel (unchanged from v1)
+ * Pass 2 — Reduction kernel (unchanged from v1/v2)
  *   Grid : (batch, num_q_heads)
  *   Block: HEAD_DIM threads.
  *   Merges split_kv partial results using the online softmax identity.
@@ -25,10 +28,10 @@
 #include <torch/extension.h>
 #include <nvToolsExt.h>
 
-// ── Pass 1: partition kernel (KV-head-centric) ───────────────────────────
+// ── Pass 1: partition kernel (v2.5 — group-fused, QK scores in shared mem) ─
 
 template<int HEAD_DIM, int PAGE_SIZE, int GROUP_SIZE>
-__global__ void decode_attn_partition_v2_kernel(
+__global__ void decode_attn_partition_v2_5_kernel(
     const __half* __restrict__ Q,
     const __half* __restrict__ KV,
     const int*    __restrict__ kv_indptr,
@@ -56,7 +59,13 @@ __global__ void decode_attn_partition_v2_kernel(
     extern __shared__ float smem[];
     SmemLayout<HEAD_DIM, PAGE_SIZE> sm(smem);
 
-    // Load all group_size Q vectors into registers
+    // Extra shared buffer for QK scores across all GROUP_SIZE heads,
+    // placed right after SmemLayout's region. Replaces the old
+    // per-thread `qk_scores[GROUP_SIZE][PAGE_SIZE]` register array.
+    float* qk_all = smem + (SmemLayout<HEAD_DIM, PAGE_SIZE>::BYTES / sizeof(float));
+
+    // Load all group_size Q vectors into registers (unchanged — this is
+    // small: GROUP_SIZE registers, not GROUP_SIZE*PAGE_SIZE)
     float q_vals[GROUP_SIZE];
     #pragma unroll
     for (int g = 0; g < GROUP_SIZE; g++) {
@@ -76,7 +85,8 @@ __global__ void decode_attn_partition_v2_kernel(
     const int split_end       = min(split_start + pages_per_split, num_pages);
     const int my_num_pages    = split_end - split_start;
 
-    // Per-q_head online softmax state
+    // Per-q_head online softmax state — unchanged, scales with GROUP_SIZE
+    // only (not GROUP_SIZE*PAGE_SIZE), so this stays cheap.
     float m_i[GROUP_SIZE];
     float l_i[GROUP_SIZE];
     float acc[GROUP_SIZE];
@@ -104,18 +114,13 @@ __global__ void decode_attn_partition_v2_kernel(
         }
         __syncthreads();
 
-        // ── QK scores + softmax + V accumulate per q_head ────────────
-        // We compute QK for each q_head using the shared K tile, then
-        // load V once and accumulate for all q_heads.
-
-        // First compute QK scores for all group_size q_heads.
-        // We reuse smem.qk (only PAGE_SIZE floats) per q_head sequentially.
-        float qk_scores[GROUP_SIZE][PAGE_SIZE];
+        // ── QK scores for all GROUP_SIZE heads, written straight into
+        //    shared memory (qk_all) instead of a per-thread register
+        //    array. This is the only structural change from v2.
         #pragma unroll
         for (int g = 0; g < GROUP_SIZE; g++) {
             float parts[PAGE_SIZE];
             #pragma unroll
-            // summing up within warp results
             for (int tok = 0; tok < PAGE_SIZE; tok++)
                 parts[tok] = warp_reduce_sum(q_vals[g] * sm.kv[tok * HEAD_DIM + tid]);
 
@@ -126,22 +131,17 @@ __global__ void decode_attn_partition_v2_kernel(
             }
             __syncthreads();
 
-            // summing up across warp results
             if (tid < PAGE_SIZE) {
                 float score = 0.0f;
                 #pragma unroll
                 for (int w = 0; w < NUM_WARPS; w++)
                     score += sm.warp[w * PAGE_SIZE + tid];
-                sm.qk[tid] = (tid < valid) ? score : -1e9f;
+                // Written directly to this head's slice of qk_all —
+                // no register copy, no per-thread storage.
+                qk_all[g * PAGE_SIZE + tid] = (tid < valid) ? score : -1e9f;
             }
-            __syncthreads();
-
-            // All threads read the finalized QK scores into registers
-            #pragma unroll
-            for (int tok = 0; tok < PAGE_SIZE; tok++)
-                qk_scores[g][tok] = sm.qk[tok];
-            // No sync needed — qk is read-only here, next g iteration
-            // will overwrite warp[] then qk[] with proper syncs.
+            __syncthreads(); // guards sm.warp overwrite by next g AND
+                              // publishes qk_all[g] to all threads
         }
 
         // ── Load V page (once for all q_heads) ──────────────────────
@@ -156,18 +156,22 @@ __global__ void decode_attn_partition_v2_kernel(
         __syncthreads();
 
         // ── Softmax + accumulate for each q_head ─────────────────────
+        // Reads qk_all[g][*] directly from shared memory — every thread
+        // reads the same small shared array rather than its own private
+        // register copy. This is a broadcast read, which is cheap and
+        // conflict-free on the shared memory crossbar.
         #pragma unroll
         for (int g = 0; g < GROUP_SIZE; g++) {
             float m_block = -1e9f;
             #pragma unroll
             for (int tok = 0; tok < PAGE_SIZE; tok++)
-                m_block = fmaxf(m_block, qk_scores[g][tok]);
+                m_block = fmaxf(m_block, qk_all[g * PAGE_SIZE + tok]);
 
             float exp_weights[PAGE_SIZE];
             float l_block = 0.0f;
             #pragma unroll
             for (int tok = 0; tok < PAGE_SIZE; tok++) {
-                exp_weights[tok] = expf(qk_scores[g][tok] - m_block);
+                exp_weights[tok] = expf(qk_all[g * PAGE_SIZE + tok] - m_block);
                 l_block += exp_weights[tok];
             }
 
@@ -177,12 +181,18 @@ __global__ void decode_attn_partition_v2_kernel(
                 acc_block += exp_weights[tok] * sm.kv[tok * HEAD_DIM + tid];
 
             const float m_new = fmaxf(m_i[g], m_block);
-            const float alpha  = expf(m_i[g]  - m_new);
+            const float alpha  = expf(m_i[g]   - m_new);
             const float beta   = expf(m_block  - m_new);
             l_i[g] = alpha * l_i[g] + beta * l_block;
             acc[g] = alpha * acc[g] + beta * acc_block;
             m_i[g] = m_new;
         }
+        // Note: no extra __syncthreads() needed here before the next
+        // page iteration's K load — that load doesn't touch qk_all, and
+        // the existing sync at the top of the next K-load section (or at
+        // loop entry via the K-load's own __syncthreads()) covers reuse
+        // of sm.kv. qk_all slices are freshly overwritten per-g at the
+        // top of next iteration's QK phase, guarded by the sync there.
     }
 
     // ── Write partial results for all q_heads in the group ───────────
@@ -197,7 +207,7 @@ __global__ void decode_attn_partition_v2_kernel(
     }
 }
 
-// ── Pass 2: reduction kernel (same as v1) ────────────────────────────────
+// ── Pass 2: reduction kernel (same as v1/v2) ─────────────────────────────
 
 template<int HEAD_DIM>
 __global__ void decode_attn_reduce_kernel(
@@ -241,9 +251,13 @@ __global__ void decode_attn_reduce_kernel(
 }
 
 // ── Host-side launchers ──────────────────────────────────────────────────
+//
+// The only change from v2's partition launcher: dynamic shared memory must
+// now include room for qk_all (GROUP_SIZE * PAGE_SIZE floats), appended
+// after SmemLayout's own region.
 
 template<int HEAD_DIM, int GROUP_SIZE>
-static void launch_partition_v2_hd(
+static void launch_partition_v2_5_hd(
     const __half* q_ptr, const __half* kv_ptr,
     const int* indptr, const int* indices, const int* last_len,
     float* po, float* pm, float* pl,
@@ -255,8 +269,16 @@ static void launch_partition_v2_hd(
     int batch, int num_kv_heads
 ) {
     constexpr int PAGE_SIZE = 16;
-    const int smem = SmemLayout<HEAD_DIM, PAGE_SIZE>::BYTES;
-    decode_attn_partition_v2_kernel<HEAD_DIM, PAGE_SIZE, GROUP_SIZE>
+
+    // Base SmemLayout region + qk_all region (GROUP_SIZE * PAGE_SIZE floats)
+    const int smem = SmemLayout<HEAD_DIM, PAGE_SIZE>::BYTES
+                    + GROUP_SIZE * PAGE_SIZE * sizeof(float);
+
+    // If this exceeds the default 48KB static limit, opt in explicitly:
+    // cudaFuncSetAttribute(decode_attn_partition_v2_5_kernel<HEAD_DIM, PAGE_SIZE, GROUP_SIZE>,
+    //                      cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+
+    decode_attn_partition_v2_5_kernel<HEAD_DIM, PAGE_SIZE, GROUP_SIZE>
         <<<dim3(batch, num_kv_heads, split_kv), HEAD_DIM, smem>>>(
             q_ptr, kv_ptr, indptr, indices, last_len,
             po, pm, pl,
@@ -291,17 +313,17 @@ static void launch_reduce_hd(
 
 // GROUP_SIZE is known at kernel compile time to enable #pragma unroll.
 // Common GQA configs: 1 (MHA), 2, 4 (Llama 3), 8 (Llama 3 70B).
-#define DISPATCH_GROUP(HD, GS, ...)                            \
-    if      (GS == 1) launch_partition_v2_hd<HD, 1>(__VA_ARGS__);  \
-    else if (GS == 2) launch_partition_v2_hd<HD, 2>(__VA_ARGS__);  \
-    else if (GS == 4) launch_partition_v2_hd<HD, 4>(__VA_ARGS__);  \
-    else if (GS == 8) launch_partition_v2_hd<HD, 8>(__VA_ARGS__);  \
-    else TORCH_CHECK(false, "Unsupported group_size: ", GS,    \
+#define DISPATCH_GROUP(HD, GS, ...)                                \
+    if      (GS == 1) launch_partition_v2_5_hd<HD, 1>(__VA_ARGS__);   \
+    else if (GS == 2) launch_partition_v2_5_hd<HD, 2>(__VA_ARGS__);   \
+    else if (GS == 4) launch_partition_v2_5_hd<HD, 4>(__VA_ARGS__);   \
+    else if (GS == 8) launch_partition_v2_5_hd<HD, 8>(__VA_ARGS__);   \
+    else TORCH_CHECK(false, "Unsupported group_size: ", GS,        \
                      ". Must be 1, 2, 4, or 8.")
 
 // ── PyTorch extension entry point ────────────────────────────────────────
 
-torch::Tensor decode_attention_split_kv_v2_cuda(
+torch::Tensor decode_attention_split_kv_v2_5_cuda(
     torch::Tensor q,
     torch::Tensor kv_data,
     torch::Tensor kv_indptr,
@@ -351,7 +373,7 @@ torch::Tensor decode_attention_split_kv_v2_cuda(
     scale, split_kv, batch, num_kv_heads
 
     // ── Pass 1: partition ─────────────────────────────────────────────
-    nvtxRangePushA("cuda_split_kv_v2_partition");
+    nvtxRangePushA("cuda_split_kv_v2_5_partition");
     if (head_dim == 64) {
         DISPATCH_GROUP(64, group_size, PART_ARGS);
     } else if (head_dim == 128) {
@@ -372,7 +394,7 @@ torch::Tensor decode_attention_split_kv_v2_cuda(
     split_kv, batch, num_q_heads
 
     // ── Pass 2: reduction ─────────────────────────────────────────────
-    nvtxRangePushA("cuda_split_kv_v2_reduce");
+    nvtxRangePushA("cuda_split_kv_v2_5_reduce");
     if      (head_dim ==  64) launch_reduce_hd< 64>(RED_ARGS);
     else if (head_dim == 128) launch_reduce_hd<128>(RED_ARGS);
     else if (head_dim == 256) launch_reduce_hd<256>(RED_ARGS);
@@ -386,10 +408,10 @@ torch::Tensor decode_attention_split_kv_v2_cuda(
 // ── pybind11 module ──────────────────────────────────────────────────────
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "CUDA decode attention — split-KV v2 (KV-head-centric grid)";
+    m.doc() = "CUDA decode attention — split-KV v2.5 (KV-head-centric grid, QK scores in shared mem)";
     m.def("decode_attention_split_kv",
-          &decode_attention_split_kv_v2_cuda,
-          "Split-KV v2: KV-head-centric partition + reduction",
+          &decode_attention_split_kv_v2_5_cuda,
+          "Split-KV v2.5: KV-head-centric partition (shared-mem QK) + reduction",
           py::arg("q"), py::arg("kv_data"), py::arg("kv_indptr"),
           py::arg("kv_indices"), py::arg("kv_last_page_len"),
           py::arg("split_kv") = 4);

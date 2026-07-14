@@ -25,6 +25,12 @@ Usage (from repo root, on a GPU runtime):
         -o decode_ncu_best -f \
         python bench/mini_driver.py --kernel split_kv --batch 16 --ctx 65536 --split-kv 16
 
+    # v2.5 kernel (v2 + QK scores in shared mem instead of registers), same shape
+    ncu --set full --kernel-name regex:decode \
+        --launch-skip 0 --launch-count 2 \
+        -o decode_ncu_v2_5 -f \
+        python bench/mini_driver.py --kernel split_kv_v2_5 --batch 16 --ctx 65536 --split-kv 16
+
     # pipelined kernel, same shape (requires SM 80+)
     ncu --set full --kernel-name regex:decode \
         --launch-skip 0 --launch-count 2 \
@@ -58,6 +64,7 @@ from cuda_.build import (
     get_naive_ext,
     get_split_kv_ext,
     get_split_kv_v2_ext,
+    get_split_kv_v2_5_ext,
     get_split_kv_pipelined_ext,
     get_split_kv_v4_ext,
 )
@@ -77,6 +84,7 @@ KERNELS = {
     "naive":              (get_naive_ext,              False),
     "split_kv":           (get_split_kv_ext,            True),
     "split_kv_v2":        (get_split_kv_v2_ext,         True),
+    "split_kv_v2_5":      (get_split_kv_v2_5_ext,       True),
     "split_kv_pipelined": (get_split_kv_pipelined_ext,  True),
     "split_kv_v4":        (get_split_kv_v4_ext,         True),
 }
